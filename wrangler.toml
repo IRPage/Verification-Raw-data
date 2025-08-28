@@ -3,8 +3,8 @@ compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = "./dist"
 
-# D1 Database configuration
-[[d1_databases]]
-binding = "DB"
-database_name = "webapp-production"
-database_id = "placeholder-create-with-wrangler"
+# Env vars (set via Pages secrets in prod, .dev.vars in local)
+[vars]
+# SUPABASE_URL
+# SUPABASE_ANON_KEY
+# SUPABASE_SERVICE_ROLE

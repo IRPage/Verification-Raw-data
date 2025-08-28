@@ -1,9 +1,12 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { handle } from 'hono/cloudflare-pages'
+import { createClient } from '@supabase/supabase-js'
 
 type Bindings = {
-  DB: D1Database;
+  SUPABASE_URL: string
+  SUPABASE_ANON_KEY: string
+  SUPABASE_SERVICE_ROLE: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -11,226 +14,231 @@ const app = new Hono<{ Bindings: Bindings }>()
 // Enable CORS for frontend-backend communication
 app.use('*', cors())
 
-// API routes
 app.get('/api/health', (c) => {
   return c.json({ message: 'WOW Scales API is healthy', timestamp: new Date().toISOString() })
 })
 
-// Verification records endpoints
+// GET: list verifications (read-only → anon key)
 app.get('/api/verifications', async (c) => {
   try {
-    const { DB } = c.env;
-    const { results } = await DB.prepare(`
-      SELECT v.*, c.client_name, c.address 
-      FROM verifications v
-      LEFT JOIN clients c ON v.client_id = c.id
-      ORDER BY v.created_at DESC
-    `).all();
-    
-    return c.json({ verifications: results });
-  } catch (error) {
-    return c.json({ error: 'Failed to fetch verifications' }, 500);
-  }
-});
+    const { SUPABASE_URL, SUPABASE_ANON_KEY } = c.env
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } })
 
+    const { data, error } = await supabase
+      .from('verifications')
+      .select('*')
+      .order('created_at', { ascending: false })
+
+    if (error) throw error
+
+    // Optionally enrich with client fields (simple second query per client_id)
+    const clientIds = Array.from(new Set((data || []).map((v) => v.client_id).filter(Boolean)))
+    let clientsMap = new Map<number, any>()
+    if (clientIds.length) {
+      const { data: clients, error: cErr } = await supabase
+        .from('clients')
+        .select('id, client_name, address')
+        .in('id', clientIds as number[])
+      if (cErr) throw cErr
+      for (const cl of clients || []) clientsMap.set(cl.id, cl)
+    }
+
+    const verifications = (data || []).map((v) => ({
+      ...v,
+      client_name: clientsMap.get(v.client_id)?.client_name ?? null,
+      address: clientsMap.get(v.client_id)?.address ?? null,
+    }))
+
+    return c.json({ verifications })
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch verifications' }, 500)
+  }
+})
+
+// POST: create verification (write → service role)
 app.post('/api/verifications', async (c) => {
   try {
-    const { DB } = c.env;
-    const data = await c.req.json();
-    
-    // Insert client first
-    const clientResult = await DB.prepare(`
-      INSERT INTO clients (client_name, address, phone, email)
-      VALUES (?, ?, ?, ?)
-      RETURNING id
-    `).bind(
-      data.client.clientName,
-      data.client.address,
-      data.client.phone || null,
-      data.client.email || null
-    ).first();
-    
-    const clientId = clientResult?.id;
-    
-    // Insert verification
-    const verificationResult = await DB.prepare(`
-      INSERT INTO verifications (
-        certificate_no, verification_date, verification_sticker,
-        client_id, status_type, accuracy_type,
-        created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-      RETURNING id
-    `).bind(
-      data.header.certNo,
-      data.header.date,
-      data.header.verSticker,
-      clientId,
-      data.status.status,
-      data.status.accType
-    ).first();
-    
-    const verificationId = verificationResult?.id;
-    
-    // Insert instrument
-    await DB.prepare(`
-      INSERT INTO instruments (
-        verification_id, manufacturer, model, serial_number,
-        accuracy_class, units, max_capacity, max_test_load_available,
-        verification_interval_e, min_capacity,
-        sa_number, aa_number, software_version, sealing_method,
-        equipment_notes, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    `).bind(
-      verificationId,
-      data.instrument.manufacturer,
-      data.instrument.model,
-      data.instrument.serial,
-      data.instrument.class,
-      data.instrument.units,
-      data.instrument.max,
-      data.instrument.maxAvail,
-      data.instrument.e,
-      data.instrument.min,
-      data.instrument.saNr,
-      data.instrument.aaNr,
-      data.instrument.software,
-      data.instrument.sealing,
-      data.instrument.equipNotes
-    ).run();
-    
-    // Insert accuracy test results
-    if (data.accuracy && data.accuracy.length > 0) {
-      for (const acc of data.accuracy) {
-        await DB.prepare(`
-          INSERT INTO accuracy_tests (
-            verification_id, test_load, make_up, indication,
-            run_up_load, run_down_load, switch_point_load,
-            error_value, band, mpe_value, result, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        `).bind(
-          verificationId,
-          acc.load || null,
-          acc.makeUp || null,
-          acc.indication || null,
-          acc.runUpLoad || null,
-          acc.runDownLoad || null,
-          acc.switchPointLoad || null,
-          acc.errorValue || null,
-          acc.band || null,
-          acc.mpeValue || null,
-          acc.result || null
-        ).run();
-      }
-    }
-    
-    // Insert variation test
-    if (data.variation) {
-      await DB.prepare(`
-        INSERT INTO variation_tests (
-          verification_id, applied_load, reference_indication,
-          end1_indication, middle_indication, end2_indication,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(
-        verificationId,
-        data.variation.appliedLoad || null,
-        data.variation.referenceIndication || null,
-        data.variation.end1 || null,
-        data.variation.middle || null,
-        data.variation.end2 || null
-      ).run();
-    }
-    
-    // Insert repeatability test
-    if (data.repeatability) {
-      await DB.prepare(`
-        INSERT INTO repeatability_tests (
-          verification_id, target_test_load,
-          run1_indication, run2_indication, run3_indication,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, datetime('now'))
-      `).bind(
-        verificationId,
-        data.repeatability.targetLoad || null,
-        data.repeatability.run1 || null,
-        data.repeatability.run2 || null,
-        data.repeatability.run3 || null
-      ).run();
-    }
-    
-    // Insert verification officer info
-    await DB.prepare(`
-      INSERT INTO verification_officers (
-        verification_id, officer_name, officer_id,
-        sanas_lab_no, seal_id, signature, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-    `).bind(
-      verificationId,
-      data.officer.officerName || null,
-      data.officer.officerId || null,
-      data.officer.sanasLabNo || null,
-      data.officer.sealId || null,
-      data.officer.signature || null
-    ).run();
-    
-    return c.json({ 
-      success: true, 
-      verificationId,
-      message: 'Verification saved successfully' 
-    });
-    
-  } catch (error) {
-    console.error('Error saving verification:', error);
-    return c.json({ error: 'Failed to save verification' }, 500);
-  }
-});
+    const { SUPABASE_URL, SUPABASE_SERVICE_ROLE } = c.env
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } })
+    const data = await c.req.json()
 
+    // 1) Insert client
+    const { data: clientData, error: clientErr } = await supabase
+      .from('clients')
+      .insert({
+        client_name: data.client.clientName,
+        address: data.client.address,
+        phone: data.client.phone || null,
+        email: data.client.email || null,
+      })
+      .select('id')
+      .single()
+    if (clientErr) throw clientErr
+    const clientId = clientData.id
+
+    // 2) Insert verification
+    const { data: verData, error: verErr } = await supabase
+      .from('verifications')
+      .insert({
+        certificate_no: data.header.certNo,
+        verification_date: data.header.date,
+        verification_sticker: data.header.verSticker,
+        client_id: clientId,
+        status_type: data.status.status,
+        accuracy_type: data.status.accType,
+      })
+      .select('id')
+      .single()
+    if (verErr) throw verErr
+    const verificationId = verData.id
+
+    // 3) Insert instrument
+    const { error: instrErr } = await supabase
+      .from('instruments')
+      .insert({
+        verification_id: verificationId,
+        manufacturer: data.instrument.manufacturer,
+        model: data.instrument.model,
+        serial_number: data.instrument.serial,
+        accuracy_class: data.instrument.class,
+        units: data.instrument.units,
+        max_capacity: data.instrument.max,
+        max_test_load_available: data.instrument.maxAvail,
+        verification_interval_e: data.instrument.e,
+        min_capacity: data.instrument.min,
+        sa_number: data.instrument.saNr,
+        aa_number: data.instrument.aaNr,
+        software_version: data.instrument.software,
+        sealing_method: data.instrument.sealing,
+        equipment_notes: data.instrument.equipNotes,
+      })
+    if (instrErr) throw instrErr
+
+    // 4) Insert accuracy tests (bulk)
+    if (Array.isArray(data.accuracy) && data.accuracy.length) {
+      const payload = data.accuracy.map((acc: any) => ({
+        verification_id: verificationId,
+        test_load: acc.load ?? null,
+        make_up: acc.makeUp ?? null,
+        indication: acc.indication ?? null,
+        run_up_load: acc.runUpLoad ?? null,
+        run_down_load: acc.runDownLoad ?? null,
+        switch_point_load: acc.switchPointLoad ?? null,
+        error_value: acc.errorValue ?? null,
+        band: acc.band ?? null,
+        mpe_value: acc.mpeValue ?? null,
+        result: acc.result ?? null,
+      }))
+      const { error } = await supabase.from('accuracy_tests').insert(payload)
+      if (error) throw error
+    }
+
+    // 5) Variation test
+    if (data.variation) {
+      const { error } = await supabase.from('variation_tests').insert({
+        verification_id: verificationId,
+        applied_load: data.variation.appliedLoad ?? null,
+        reference_indication: data.variation.referenceIndication ?? null,
+        end1_indication: data.variation.end1 ?? null,
+        middle_indication: data.variation.middle ?? null,
+        end2_indication: data.variation.end2 ?? null,
+      })
+      if (error) throw error
+    }
+
+    // 6) Repeatability test
+    if (data.repeatability) {
+      const { error } = await supabase.from('repeatability_tests').insert({
+        verification_id: verificationId,
+        target_test_load: data.repeatability.targetLoad ?? null,
+        run1_indication: data.repeatability.run1 ?? null,
+        run2_indication: data.repeatability.run2 ?? null,
+        run3_indication: data.repeatability.run3 ?? null,
+      })
+      if (error) throw error
+    }
+
+    // 7) Officer
+    const { error: officerErr } = await supabase.from('verification_officers').insert({
+      verification_id: verificationId,
+      officer_name: data.officer.officerName ?? null,
+      officer_id: data.officer.officerId ?? null,
+      sanas_lab_no: data.officer.sanasLabNo ?? null,
+      seal_id: data.officer.sealId ?? null,
+      signature: data.officer.signature ?? null,
+    })
+    if (officerErr) throw officerErr
+
+    return c.json({ success: true, verificationId, message: 'Verification saved successfully' })
+  } catch (error) {
+    console.error('Error saving verification:', error)
+    return c.json({ error: 'Failed to save verification' }, 500)
+  }
+})
+
+// GET: single verification and related data (read-only → anon key)
 app.get('/api/verifications/:id', async (c) => {
   try {
-    const { DB } = c.env;
-    const id = c.req.param('id');
-    
-    // Get verification with related data
-    const verification = await DB.prepare(`
-      SELECT v.*, c.client_name, c.address, c.phone, c.email,
-             i.*, vo.officer_name, vo.officer_id, vo.sanas_lab_no, vo.seal_id, vo.signature
-      FROM verifications v
-      LEFT JOIN clients c ON v.client_id = c.id
-      LEFT JOIN instruments i ON v.id = i.verification_id
-      LEFT JOIN verification_officers vo ON v.id = vo.verification_id
-      WHERE v.id = ?
-    `).bind(id).first();
-    
-    if (!verification) {
-      return c.json({ error: 'Verification not found' }, 404);
+    const { SUPABASE_URL, SUPABASE_ANON_KEY } = c.env
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false } })
+    const id = Number(c.req.param('id'))
+
+    const { data: verification, error: verErr } = await supabase
+      .from('verifications')
+      .select('*')
+      .eq('id', id)
+      .single()
+    if (verErr) throw verErr
+
+    const clientId = verification?.client_id
+    let client: any = null
+    if (clientId) {
+      const { data: cData, error: cErr } = await supabase
+        .from('clients')
+        .select('client_name,address,phone,email')
+        .eq('id', clientId)
+        .single()
+      if (cErr) throw cErr
+      client = cData
     }
-    
-    // Get accuracy tests
-    const accuracyTests = await DB.prepare(`
-      SELECT * FROM accuracy_tests WHERE verification_id = ? ORDER BY id
-    `).bind(id).all();
-    
-    // Get variation test
-    const variationTest = await DB.prepare(`
-      SELECT * FROM variation_tests WHERE verification_id = ?
-    `).bind(id).first();
-    
-    // Get repeatability test
-    const repeatabilityTest = await DB.prepare(`
-      SELECT * FROM repeatability_tests WHERE verification_id = ?
-    `).bind(id).first();
-    
-    return c.json({ 
-      verification,
-      accuracyTests: accuracyTests.results || [],
-      variationTest,
-      repeatabilityTest
-    });
-    
+
+    const { data: accuracyTests, error: accErr } = await supabase
+      .from('accuracy_tests')
+      .select('*')
+      .eq('verification_id', id)
+      .order('id', { ascending: true })
+    if (accErr) throw accErr
+
+    const { data: variationTest, error: varErr } = await supabase
+      .from('variation_tests')
+      .select('*')
+      .eq('verification_id', id)
+      .maybeSingle()
+    if (varErr) throw varErr
+
+    const { data: repeatabilityTest, error: repErr } = await supabase
+      .from('repeatability_tests')
+      .select('*')
+      .eq('verification_id', id)
+      .maybeSingle()
+    if (repErr) throw repErr
+
+    return c.json({
+      verification: {
+        ...verification,
+        client_name: client?.client_name ?? null,
+        address: client?.address ?? null,
+        phone: client?.phone ?? null,
+        email: client?.email ?? null,
+      },
+      accuracyTests: accuracyTests || [],
+      variationTest: variationTest || null,
+      repeatabilityTest: repeatabilityTest || null,
+    })
   } catch (error) {
-    return c.json({ error: 'Failed to fetch verification' }, 500);
+    return c.json({ error: 'Failed to fetch verification' }, 500)
   }
-});
+})
 
 export default app
 

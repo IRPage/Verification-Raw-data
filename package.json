@@ -12,11 +12,11 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler pages deploy dist",
-    "db:migrate:local": "wrangler d1 migrations apply webapp-production --local",
-    "db:migrate:prod": "wrangler d1 migrations apply webapp-production",
-    "db:seed": "wrangler d1 execute webapp-production --local --file=./seed.sql",
-    "db:reset": "rm -rf .wrangler/state/v3/d1 && npm run db:migrate:local && npm run db:seed",
-    "db:console:local": "wrangler d1 execute webapp-production --local",
+    
+    
+    
+    
+    
     "test": "curl http://localhost:3000",
     "clean-port": "fuser -k 3000/tcp 2>/dev/null || true"
   },
@@ -24,6 +24,7 @@
     "@cloudflare/workers-types": "^4.20250826.0",
     "@hono/node-server": "^1.19.0",
     "@hono/vite-cloudflare-pages": "^0.4.2",
+    "@supabase/supabase-js": "^2.56.0",
     "concurrently": "^9.2.1",
     "hono": "^4.9.4",
     "react": "^19.1.1",
